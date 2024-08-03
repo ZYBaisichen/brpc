@@ -1155,7 +1155,10 @@ void Socket::OnRecycle() {
 void* Socket::ProcessEvent(void* arg) {
     // the enclosed Socket is valid and free to access inside this function.
     SocketUniquePtr s(static_cast<Socket*>(arg));
-    s->_on_edge_triggered_events(s.get());
+    //这里_on_edge_triggered_events函数就是启动时在Acceptor::StartAccept函数中复制的
+    //options.on_edge_triggered_events = OnNewConnections;
+    //Acceptor::OnNewConnections是一个静态函数内部调用OnNewConnectionsUntilEAGAIN创建客户端fd，不断处理客户端发来的消息
+    s->_on_edge_triggered_events(s.get()); 
     return NULL;
 }
 
@@ -2152,6 +2155,7 @@ int Socket::StartInputEvent(SocketId id, uint32_t events,
         // According to the stats, above fetch_add is very effective. In a
         // server processing 1 million requests per second, this counter
         // is just 1500~1700/s
+        // fetch_add的高效add
         g_vars->neventthread << 1;
 
         bthread_t tid;
@@ -2160,9 +2164,10 @@ int Socket::StartInputEvent(SocketId id, uint32_t events,
 
         bthread_attr_t attr = thread_attr;
         attr.keytable_pool = p->_keytable_pool;
+        //bthread_start_urgent函数启动时会让出当前线程。官方文档上说：EventDispatcher把所在的pthread让给了新建的bthread，使其有更好的cache locality，可以尽快地读取fd上的数据
         if (bthread_start_urgent(&tid, &attr, ProcessEvent, p) != 0) {
             LOG(FATAL) << "Fail to start ProcessEvent";
-            ProcessEvent(p);
+            ProcessEvent(p); //启动失败则原地运行
         }
     }
     return 0;

@@ -254,6 +254,7 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
         struct sockaddr_storage in_addr;
         bzero(&in_addr, sizeof(in_addr));
         socklen_t in_len = sizeof(in_addr);
+        //调用accept监听，获得客户端fd，析构的时候调用::close(_fd);
         butil::fd_guard in_fd(accept(acception->fd(), (sockaddr*)&in_addr, &in_len));
         if (in_fd < 0) {
             // no EINTR because listened fd is non-blocking.
@@ -292,9 +293,11 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
 #else
         {
 #endif
+            //注册客户端处理函数
             options.on_edge_triggered_events = InputMessenger::OnNewMessages;
         }
         options.use_rdma = am->_use_rdma;
+        //
         if (Socket::Create(options, &socket_id) != 0) {
             LOG(ERROR) << "Fail to create Socket";
             continue;
