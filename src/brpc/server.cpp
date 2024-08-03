@@ -601,9 +601,9 @@ Acceptor* Server::BuildAcceptor() {
         }
         // `process_request' is required at server side
         handler.parse = protocols[i].parse;
-        handler.process = protocols[i].process_request;
+        handler.process = protocols[i].process_request;//这里会决定具体的协议到来后的处理函数
         handler.verify = protocols[i].verify;
-        handler.arg = this;
+        handler.arg = this;//这里会在后面调socket->CallMethod
         handler.name = protocols[i].name;
         if (acceptor->AddHandler(handler) != 0) {
             LOG(ERROR) << "Fail to add handler into Acceptor("

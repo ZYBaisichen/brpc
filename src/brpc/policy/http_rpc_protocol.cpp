@@ -1262,6 +1262,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     DestroyingPtr<HttpContext> imsg_guard(static_cast<HttpContext*>(msg));
     SocketUniquePtr socket_guard(imsg_guard->ReleaseSocket());
     Socket* socket = socket_guard.get();
+    //这里的 msg->arg其实就是在启动时的server指针，在server::BuildAcceptor中的handler.arg = this;
     const Server* server = static_cast<const Server*>(msg->arg());
     ScopedNonServiceError non_service_error(server);
 
@@ -1382,7 +1383,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         return svc->CallMethod(md, cntl, NULL, NULL, done);
     }
     
-    const Server::MethodProperty* const sp =
+    const Server::MethodProperty* const sp = //找到方法属性，里面包括service*,method和url之类的
         FindMethodPropertyByURI(path, server, &req_header._unresolved_path);
     if (NULL == sp) {
         if (security_mode) {
@@ -1565,9 +1566,10 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     if (span) {
         span->set_start_callback_us(butil::cpuwide_time_us());
         span->AsParent();
-    }
-    if (!FLAGS_usercode_in_pthread) {
-        return svc->CallMethod(method, cntl, req, res, done);
+    }    
+    //具体的打包发送则是通过调用done->Run()，在推荐用法里，由RAII机制保证，也就是上图的done_guard。析构函数中会调用done->run()
+    if (!FLAGS_usercode_in_pthread) { 
+        return svc->CallMethod(method, cntl, req, res, done);//在这里调用的业务代码, 比如官方例子中的Echo接口
     }
     if (BeginRunningUserCode()) {
         svc->CallMethod(method, cntl, req, res, done);

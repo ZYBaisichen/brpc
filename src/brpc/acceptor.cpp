@@ -297,7 +297,7 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
             options.on_edge_triggered_events = InputMessenger::OnNewMessages;
         }
         options.use_rdma = am->_use_rdma;
-        //
+        //创建客户端socket
         if (Socket::Create(options, &socket_id) != 0) {
             LOG(ERROR) << "Fail to create Socket";
             continue;
