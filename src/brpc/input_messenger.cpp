@@ -228,6 +228,7 @@ int InputMessenger::ProcessNewMessage(
     int num_bthread_created = 0;
     while (1) {
         size_t index = 8888;
+        //消息切割一部分出来
         ParseResult pr = CutInputMessage(m, &index, read_eof);
         if (!pr.is_ok()) {
             if (pr.error() == PARSE_ERROR_NOT_ENOUGH_DATA) {
