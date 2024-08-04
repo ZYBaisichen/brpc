@@ -40,6 +40,7 @@ __BEGIN_DECLS
 // `tid'. Switch to the new thread and schedule old thread to run. Use this
 // function when the new thread is more urgent.
 // Returns 0 on success, errno otherwise.
+//通过bthread_start_urgent创建的线程以高优先级执行，bthread_start_background以低优先级执行
 extern int bthread_start_urgent(bthread_t* __restrict tid,
                                 const bthread_attr_t* __restrict attr,
                                 void * (*fn)(void*),

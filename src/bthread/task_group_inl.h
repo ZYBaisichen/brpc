@@ -61,8 +61,10 @@ inline void TaskGroup::exchange(TaskGroup** pg, bthread_t next_tid) {
 
 inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
     TaskMeta* next_meta = address_meta(next_tid);
-    if (next_meta->stack == NULL) {
-        ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
+    if (next_meta->stack == NULL) { //如果stack为空，则说明是一个新的bthread
+        //task_runner这里是真正的用户调用的函数
+        //经过层层调用，会在bthread_make_fcontext中作为参数传进去
+        ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner); //从object pool资源池中拿到新的stack
         if (stk) {
             next_meta->set_stack(stk);
         } else {
@@ -75,7 +77,7 @@ inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
         }
     }
     // Update now_ns only when wait_task did yield.
-    sched_to(pg, next_meta);
+    sched_to(pg, next_meta); //执行重载函数，做线程数据的切换
 }
 
 inline void TaskGroup::push_rq(bthread_t tid) {

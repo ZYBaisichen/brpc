@@ -57,12 +57,15 @@ void run_worker_startfn() {
 }
 
 void* TaskControl::worker_thread(void* arg) {
+    //这里的startfn就是besas中调用bthread_set_worker_startfn来设置的函数，进程级别启动时的初始化
+    //可以看出，这里在pthread创建的时候也会执行这个startfn
     run_worker_startfn();    
 #ifdef BAIDU_INTERNAL
     logging::ComlogInitializer comlog_initializer;
 #endif
     
     TaskControl* c = static_cast<TaskControl*>(arg);
+    //创建taskgroup，并将其放入_groups中
     TaskGroup* g = c->create_group();
     TaskStatistics stat;
     if (NULL == g) {
@@ -78,7 +81,7 @@ void* TaskControl::worker_thread(void* arg) {
 
     tls_task_group = g;
     c->_nworkers << 1;
-    g->run_main_task();
+    g->run_main_task(); //bthread主入口。taskgroup内部循环等待可以执行的bthread。这也是bthread运行在pthread上的基石
 
     stat = g->main_stat();
     BT_VLOG << "Destroying worker=" << pthread_self() << " bthread="
@@ -101,6 +104,7 @@ TaskGroup* TaskControl::create_group() {
         delete g;
         return NULL;
     }
+    //存在_groups中
     if (_add_group(g) != 0) {
         delete g;
         return NULL;
@@ -161,6 +165,7 @@ int TaskControl::init(int concurrency) {
     _concurrency = concurrency;
 
     // Make sure TimerThread is ready.
+    //TimerThread是干嘛的？
     if (get_or_create_global_timer_thread() == NULL) {
         LOG(ERROR) << "Fail to get global_timer_thread";
         return -1;
@@ -168,6 +173,7 @@ int TaskControl::init(int concurrency) {
     
     _workers.resize(_concurrency);   
     for (int i = 0; i < _concurrency; ++i) {
+        //这里创建了_concurrency个pthread线程，每个线程的id存在workers中
         const int rc = pthread_create(&_workers[i], NULL, worker_thread, this);
         if (rc) {
             LOG(ERROR) << "Fail to create _workers[" << i << "], " << berror(rc);
@@ -353,6 +359,8 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         TaskGroup* g = _groups[s % ngroup];
         // g is possibly NULL because of concurrent _destroy_group
         if (g) {
+            //先从taskgroup上的本地请求窃取， 然后从remote_req上窃取
+            //_req队列pop的时候从req弹出。steal从尾部窃取
             if (g->_rq.steal(tid)) {
                 stolen = true;
                 break;

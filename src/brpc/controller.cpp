@@ -1018,8 +1018,15 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // Pick a target server for sending RPC
     _current_call.need_feedback = false;
     _current_call.enable_circuit_breaker = has_enabled_circuit_breaker();
-    SocketUniquePtr tmp_sock;
-    if (SingleServer()) {
+    SocketUniquePtr tmp_sock; //使用临时socket。
+    /*
+    下面使用链接类型配置tmp_sock的远端地址
+    在client.md中描述了brpc支持的方式，在这里抄一下
+    - 短连接：每次RPC前建立连接，结束后关闭连接。由于每次调用得有建立连接的开销，这种方式一般用于偶尔发起的操作，而不是持续发起请求的场景。没有协议默认使用这种连接方式，http/1.0对连接的处理效果类似短链接。
+    - 连接池：每次RPC前取用空闲连接，结束后归还，一个连接上最多只有一个请求，一个client对一台server可能有多条连接。http/1.1和各类使用nshead的协议都是这个方式。
+    - 单连接：进程内所有client与一台server最多只有一个连接，一个连接上可能同时有多个请求，回复返回顺序和请求顺序不需要一致，这是baidu_std，hulu_pbrpc，sofa_pbrpc协议的默认选项。
+    */ 
+    if (SingleServer()) {  //判断是否是单链接
         // Don't use _current_call.peer_id which is set to -1 after construction
         // of the backup call.
         const int rc = Socket::Address(_single_server_id, &tmp_sock);
@@ -1029,7 +1036,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
             tmp_sock.reset();  // Release ref ASAP
             return HandleSendFailed();
         }
-        _current_call.peer_id = _single_server_id;
+        _current_call.peer_id = _single_server_id; //拿到单链接server的id
     } else {
         LoadBalancer::SelectIn sel_in =
             { start_realtime_us, true,
@@ -1075,7 +1082,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     if (_connection_type == CONNECTION_TYPE_SINGLE ||
         _stream_creator != NULL) { // let user decides the sending_sock
         // in the callback(according to connection_type) directly
-        _current_call.sending_sock.reset(tmp_sock.release());
+        _current_call.sending_sock.reset(tmp_sock.release()); //如果是单链接，直接使用tmp_sock
         // TODO(gejun): Setting preferred index of single-connected socket
         // has two issues:
         //   1. race conditions. If a set perferred_index is overwritten by
@@ -1085,6 +1092,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         _current_call.sending_sock->set_preferred_index(_preferred_index);
     } else {
         int rc = 0;
+        //链接池或者短连接，则根据tmp_sock的的一些信息，得到链接池socket或者短连接，然后释放掉tmp_sock
+        //这里获得的每个socket都是注册了epoll_in事件的，事件触发后，调用之前的onNewMessage。等待response的时候会触发
         if (_connection_type == CONNECTION_TYPE_POOLED) {
             rc = tmp_sock->GetPooledSocket(&_current_call.sending_sock);
         } else if (_connection_type == CONNECTION_TYPE_SHORT) {
@@ -1122,6 +1131,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
 
     // Handle authentication
+    //做身份验证
     const Authenticator* using_auth = NULL;
     if (_auth != NULL) {
         // Only one thread will be the winner and get the right to pack
@@ -1139,6 +1149,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // Make request
     butil::IOBuf packet;
     SocketMessage* user_packet = NULL;
+    //协议打包，挡在
     _pack_request(&packet, &user_packet, cid.value, _method, this,
                   _request_buf, using_auth);
     // TODO: PackRequest may accept SocketMessagePtr<>?

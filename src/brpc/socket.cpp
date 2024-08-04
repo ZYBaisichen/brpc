@@ -1173,25 +1173,31 @@ void* Socket::ProcessEvent(void* arg) {
 bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
                              bool singular_node,
                              Socket::WriteRequest** new_tail) {
+    //如果当前线程抢到了写操作，则原_write_head中是没有数据的，调用此函数时当前正在发送的_req就是old_head。
+    //如果当有别的线程需要写的话，会挂到_req前，_write_head指向新的头
     CHECK(NULL == old_head->next);
     // Try to set _write_head to NULL to mark that the write is done.
     WriteRequest* new_head = old_head;
     WriteRequest* desired = NULL;
-    bool return_when_no_more = true;
-    if (!old_head->data.empty() || !singular_node) {
+    bool return_when_no_more = true;//return_when_no_more是在没有更新下的返回值，如果写完了返回true
+    //desired是想要赋值给_write_head的值，初始为nullptr，如果old_head不为空，则会将_write_head赋值为old_head(_req)，代表还需要继续写
+    if (!old_head->data.empty() || !singular_node) { 
         desired = old_head;
         // Write is obviously not complete if old_head is not fully written.
-        return_when_no_more = false;
+        return_when_no_more = false; 
     }
+    //如果失败代表有新的线程往fd中加了请求，将new_head置为新的_write_head
+    //如果成功，则会将_write_head置为NULL, 代表已经没有要写的了
+    //
     if (_write_head.compare_exchange_strong(
             new_head, desired, butil::memory_order_acquire)) {
         // No one added new requests.
-        if (new_tail) {
+        if (new_tail) { //tail不为空则赋值为old_head, 应该是为了一些事情？
             *new_tail = old_head;
         }
         return return_when_no_more;
     }
-    CHECK_NE(new_head, old_head);
+    CHECK_NE(new_head, old_head); //断言两者不相等
     // Above acquire fence pairs release fence of exchange in Write() to make
     // sure that we see all fields of requests set.
 
@@ -1199,11 +1205,15 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
     // Reverse the list until old_head.
     WriteRequest* tail = NULL;
     WriteRequest* p = new_head;
+    //下面的操作是反转链表
+    //假设此时链表是3->2->1， new_head是3，链表反转会变成3<-2<-1。 
+    //如果在反转过程中如果还有一个4过来，则不会做处理整体以_write_head开头的链表会变成4->3<-2<-1
     do {
         while (p->next == WriteRequest::UNCONNECTED) {
             // TODO(gejun): elaborate this
             sched_yield();
         }
+        //一下四句话就是反转链表
         WriteRequest* const saved_next = p->next;
         p->next = tail;
         tail = p;
@@ -1220,8 +1230,9 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
         q->Setup(this);
     }
     if (new_tail) {
-        *new_tail = new_head;
+        *new_tail = new_head; //bsc: 新的链表的结尾处会指向4->3<-2<-1的3，怪不得要加上个tail，保存的是反转链表的结尾节点. 对应KeepWrite中的IsWriteComplete调用
     }
+    //如果有新请求到来，会在外层走到KEEPWRITE_IN_BACKGROUND位置
     return false;
 }
 
@@ -1376,14 +1387,14 @@ int Socket::CheckConnected(int sockfd) {
 
 int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
     if (_fd.load(butil::memory_order_consume) >= 0) {
-       return 0;
+       return 0; //已有链接
     }
 
     // Have to hold a reference for `req'
     SocketUniquePtr s;
     ReAddress(&s);
     req->socket = s.get();
-    if (_conn) {
+    if (_conn) { //创建链接，调用KeepWriteIfConnected回调函数
         if (_conn->Connect(this, abstime, KeepWriteIfConnected, req) < 0) {
             return -1;
         }
@@ -1652,9 +1663,15 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
 }
 
 int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
+    /*
+    bsc: 因为同一个socket fd有可能有多个线程在写，所以为了提高性能和吞吐，所以发送消息这里比较复杂，先贴一下官方文档：
+    "消息”指向连接写出的有边界的二进制串，可能是发向上游client的response或下游server的request。多个线程可能会同时向一个fd发送消息，而写fd又是非原子的，所以如何高效率地排队不同线程写出的数据包是这里的关键。brpc使用一种wait-free MPSC链表来实现这个功能。所有待写出的数据都放在一个单链表节点中，next指针初始化为一个特殊值(Socket::WriteRequest::UNCONNECTED)。当一个线程想写出数据前，它先尝试和对应的链表头(Socket::_write_head)做原子交换，返回值是交换前的链表头。如果返回值为空，说明它获得了写出的权利，它会在原地写一次数据。否则说明有另一个线程在写，它把next指针指向返回的头以让链表连通。正在写的线程之后会看到新的头并写出这块数据。
+    */
     // Release fence makes sure the thread getting request sees *req
+    //当前要写的请求尝试给_write_head复制，返回的是老的_write_head值，如果老的_write_head不为空，则代表已经有现成在写了
+    //如果老的_write_head是空，则说明当前线程独占，此时_write_head等于req，其他线程将看到_write_head不为空
     WriteRequest* const prev_head =
-        _write_head.exchange(req, butil::memory_order_release);
+        _write_head.exchange(req, butil::memory_order_release); 
     if (prev_head != NULL) {
         // Someone is writing to the fd. The KeepWrite thread may spin
         // until req->next to be non-UNCONNECTED. This process is not
@@ -1662,6 +1679,12 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
         // depending on compiler) that the spin rarely occurs in practice
         // (I've not seen any spin in highly contended tests).
         req->next = prev_head;
+        /*
+        bsc: 头插法，此时_write_head和req的值相同，将req放在开头。
+        假设一个fd上同时到来三个写请求，并且在整个过程中第一个写请求都没有写完，第一个请求到来时_write_head=1，链表只有1->nullptr;
+        第二个请求到来时头插法放在开头，_write_head=2， 链表是2->1->null
+        第三个请求到来时头插法放在开头，_write_head=3, 链表变成3->2->1->null
+        */
         return 0;
     }
 
@@ -1674,6 +1697,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     req->next = NULL;
     
     // Connect to remote_side() if not.
+    //bsc： 如果没有连接则会创建。返回值：0标识原来已连接，-1标识连接失败，1表示创建了正在连接
     int ret = ConnectIfNot(opt.abstime, req);
     if (ret < 0) {
         saved_errno = errno;
@@ -1690,7 +1714,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     // in some protocols(namely RTMP).
     req->Setup(this);
     
-    if (ssl_state() != SSL_OFF) {
+    if (ssl_state() != SSL_OFF) {   //开启ssl认证后总是后台写
         // Writing into SSL may block the current bthread, always write
         // in the background.
         goto KEEPWRITE_IN_BACKGROUND;
@@ -1702,6 +1726,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
         butil::IOBuf* data_arr[1] = { &req->data };
         nw = _conn->CutMessageIntoFileDescriptor(fd(), data_arr, 1);
     } else {
+//RDMA:全程存储技术
 #if BRPC_WITH_RDMA
         if (_rdma_ep && _rdma_state != RDMA_OFF) {
             butil::IOBuf* data_arr[1] = { &req->data };
@@ -1737,7 +1762,7 @@ KEEPWRITE_IN_BACKGROUND:
     if (bthread_start_background(&th, &BTHREAD_ATTR_NORMAL,
                                  KeepWrite, req) != 0) {
         LOG(FATAL) << "Fail to start KeepWrite";
-        KeepWrite(req);
+        KeepWrite(req); //启动新线程不成功，则原地写
     }
     return 0;
 
@@ -1753,8 +1778,9 @@ FAIL_TO_WRITE:
 static const size_t DATA_LIST_MAX = 256;
 
 void* Socket::KeepWrite(void* void_arg) {
-    g_vars->nkeepwrite << 1;
-    WriteRequest* req = static_cast<WriteRequest*>(void_arg);
+    g_vars->nkeepwrite << 1; //调用keep_write次数+1
+    //bsc: 优先写当前的req。在调用Iswritecomplete函数的时候已经将链表反转了，所以req->next其实就是在req之后到来的写请求
+    WriteRequest* req = static_cast<WriteRequest*>(void_arg); 
     SocketUniquePtr s(req->socket);
 
     // When error occurs, spin until there's no more requests instead of
@@ -1763,12 +1789,14 @@ void* Socket::KeepWrite(void* void_arg) {
     WriteRequest* cur_tail = NULL;
     do {
         // req was written, skip it.
-        if (req->next != NULL && req->data.empty()) {
+        if (req->next != NULL && req->data.empty()) { //bsc: 当前需要写的data数据都写完了
             WriteRequest* const saved_req = req;
             req = req->next;
-            s->ReturnSuccessfulWriteRequest(saved_req);
+            s->ReturnSuccessfulWriteRequest(saved_req); //释放掉已经完成的req
         }
-        const ssize_t nw = s->DoWrite(req);
+        //req来到了下一个请求，DoWrite会截取msg，然后写入，直到没有message到来
+        //内部会对req链表上的所有已经识别到的请求处理
+        const ssize_t nw = s->DoWrite(req); 
         if (nw < 0) {
             if (errno != EAGAIN && errno != EOVERCROWDED) {
                 const int saved_errno = errno;
@@ -1778,9 +1806,10 @@ void* Socket::KeepWrite(void* void_arg) {
                 break;
             }
         } else {
-            s->AddOutputBytes(nw);
+            s->AddOutputBytes(nw);//到来的数据大小
         }
         // Release WriteRequest until non-empty data or last request.
+        //批量释放已经处理完的请求，如果最后req不是最后一个，则最后一个还没写完。
         while (req->next != NULL && req->data.empty()) {
             WriteRequest* const saved_req = req;
             req = req->next;
@@ -1839,13 +1868,26 @@ void* Socket::KeepWrite(void* void_arg) {
                 }
             }
         }
+        //如果链表此时是4->3<-2<-1，则让cur_tail指向3，调用下面的IsWriteComplete，里面会把4反转过来
         if (NULL == cur_tail) {
             for (cur_tail = req; cur_tail->next != NULL;
                  cur_tail = cur_tail->next);
         }
         // Return when there's no more WriteRequests and req is completely
         // written.
-        if (s->IsWriteComplete(cur_tail, (req == cur_tail), &cur_tail)) {
+        //这里会把4反转过来后，更新cur_tail，这就呼应了IsWriteComplete里面为什么要有*new_tail = new_head; 这句话
+        //req == cur_tail代表原本也只有一个请求需要写
+        /*
+        1.req == cur_tail ，有新来的req
+        原本只有一个要写，但有新来的所以compare_exchange_strong失败，做翻转后新尾更新到cur_tail，返回false，未写完
+        2.req == cur_tail ，没有新来的req
+        原本只有一个要写，而且没有新来的，如果这一个没写完返回false，写完了返回true
+        3.req != cur_tail ，有新来的req。 
+        因为!singular_node成立，所以return_when_no_more = false，但有新来的所以compare_exchange_strong失败，做后面的翻转操作，比如上面图的例子，再次调用iswritecomplete后4会成为翻转后的新尾，更新到cur_tail，保证后面的循环回写到。
+        4.req != cur_tail , 没有新来的req。bsc: 这时代表着前面还有数据没有写完
+        因为!singular_node成立，所以return_when_no_more = false，且compare_exchange_strong成功，直接返回return_when_no_more，也就是false。
+        */
+        if (s->IsWriteComplete(cur_tail, (req == cur_tail), &cur_tail)) { /
             CHECK_EQ(cur_tail, req);
             s->ReturnSuccessfulWriteRequest(req);
             return NULL;

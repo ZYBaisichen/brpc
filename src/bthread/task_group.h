@@ -212,12 +212,14 @@ friend class TaskControl;
     bool wait_task(bthread_t* tid);
 
     bool steal_task(bthread_t* tid) {
+        //从全局_remote_rq队列上看能不能拿到tid
         if (_remote_rq.pop(tid)) {
             return true;
         }
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
         _last_pl_state = _pl->get_state();
 #endif
+        //否则从其他worker上拿
         return _control->steal_task(tid, &_steal_seed, _steal_offset);
     }
 

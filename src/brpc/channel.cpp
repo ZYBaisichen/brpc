@@ -572,7 +572,8 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     } else {
         cntl->_deadline_us = -1;
     }
-
+    
+    // 前面设置各种参数，这里真正的发起了rpc调用
     cntl->IssueRPC(start_send_real_us);
     if (done == NULL) {
         // MUST wait for response when sending synchronous RPC. It will

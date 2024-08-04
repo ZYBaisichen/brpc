@@ -115,13 +115,17 @@ bool TaskGroup::is_stopped(bthread_t tid) {
     return true;
 }
 
+//参考：https://zhuanlan.zhihu.com/p/346081659
 bool TaskGroup::wait_task(bthread_t* tid) {
     do {
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
         if (_last_pl_state.stopped()) {
             return false;
         }
+        //_pl数组顾名思义就是停车位，一共有4个。TaskGroup初始化时使用pthreadid对4取模决定_pl是多少
+        //之所以有4个停车位，大概率是为了减少race condition
         _pl->wait(_last_pl_state);
+        //去其他的worker上偷bthread
         if (steal_task(tid)) {
             return true;
         }
@@ -144,13 +148,13 @@ static double get_cumulated_cputime_from_this(void* arg) {
 
 void TaskGroup::run_main_task() {
     bvar::PassiveStatus<double> cumulated_cputime(
-        get_cumulated_cputime_from_this, this);
+        get_cumulated_cputime_from_this, this); //从这里开始计算cputime
     std::unique_ptr<bvar::PerSecond<bvar::PassiveStatus<double> > > usage_bvar;
 
     TaskGroup* dummy = this;
     bthread_t tid;
     while (wait_task(&tid)) {
-        TaskGroup::sched_to(&dummy, tid);
+        TaskGroup::sched_to(&dummy, tid); //得到一个线程后立刻调度执行
         DCHECK_EQ(this, dummy);
         DCHECK_EQ(_cur_meta->stack, _main_stack);
         if (_cur_meta->tid != _main_tid) {
@@ -195,6 +199,7 @@ TaskGroup::TaskGroup(TaskControl* c)
 {
     _steal_seed = butil::fast_rand();
     _steal_offset = OFFSET_TABLE[_steal_seed % ARRAY_SIZE(OFFSET_TABLE)];
+    //四个停车位，按照pthreadid的hash取模来决定停哪里
     _pl = &c->_pl[butil::fmix64(pthread_numeric_id()) % TaskControl::PARKING_LOT_NUM];
     CHECK(c);
 }
@@ -292,7 +297,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // libraries.
         void* thread_return;
         try {
-            thread_return = m->fn(m->arg);
+            thread_return = m->fn(m->arg); //这里的fn和启动bthread时传进来的fn函数和参数相对应
         } catch (ExitException& e) {
             thread_return = e.value();
         }
@@ -366,6 +371,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     const int64_t start_ns = butil::cpuwide_time_ns();
     const bthread_attr_t using_attr = (attr ? *attr : BTHREAD_ATTR_NORMAL);
     butil::ResourceId<TaskMeta> slot;
+    //从ResourcePool拿到一个taskMeta
     TaskMeta* m = butil::get_resource(&slot);
     if (__builtin_expect(!m, 0)) {
         return ENOMEM;
@@ -374,6 +380,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     m->stop = false;
     m->interrupted = false;
     m->about_to_quit = false;
+    //主要的是fn和arg的赋值，这里会直接调度赋值
     m->fn = fn;
     m->arg = arg;
     CHECK(m->stack == NULL);
@@ -408,6 +415,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
             (bool)(using_attr.flags & BTHREAD_NOSIGNAL)
         };
         g->set_remained(fn, &args);
+        //立刻调度执行
         TaskGroup::sched_to(pg, m->tid);
     }
     return 0;
@@ -448,6 +456,7 @@ int TaskGroup::start_background(bthread_t* __restrict th,
         LOG(INFO) << "Started bthread " << m->tid;
     }
     _control->_nbthreads << 1;
+    //bthread_start_background调用时REMOTE是false，表名非远程启动
     if (REMOTE) {
         ready_to_run_remote(m->tid, (using_attr.flags & BTHREAD_NOSIGNAL));
     } else {
@@ -593,6 +602,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     if (__builtin_expect(next_meta != cur_meta, 1)) {
         g->_cur_meta = next_meta;
         // Switch tls_bls
+        //切换线程变量
         cur_meta->local_storage = tls_bls;
         tls_bls = next_meta->local_storage;
 
@@ -604,9 +614,10 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                       << next_meta->tid;
         }
 
+        //堆栈切换
         if (cur_meta->stack != NULL) {
             if (next_meta->stack != cur_meta->stack) {
-                jump_stack(cur_meta->stack, next_meta->stack);
+                jump_stack(cur_meta->stack, next_meta->stack);  //内部调用bthread_jump_fcontext，去操作寄存器完成线程切换
                 // probably went to another group, need to assign g again.
                 g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             }
@@ -651,13 +662,14 @@ void TaskGroup::destroy_self() {
 }
 
 void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
-    push_rq(tid);
-    if (nosignal) {
+    push_rq(tid); //放在_req队列
+    if (nosignal) { //一般都会是false
         ++_num_nosignal;
     } else {
         const int additional_signal = _num_nosignal;
         _num_nosignal = 0;
         _nsignaled += 1 + additional_signal;
+        //通知其他人来消费
         _control->signal_task(1 + additional_signal);
     }
 }
@@ -670,10 +682,12 @@ void TaskGroup::flush_nosignal_tasks() {
         _control->signal_task(val);
     }
 }
-
+//来自非worker的bthread放在_remote_rq中，是加锁保护的队列
+//来自本地的放在_req队列，wait-free
 void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
     _remote_rq._mutex.lock();
-    while (!_remote_rq.push_locked(tid)) {
+    //加锁入队列，如果失败则等待1s再尝试。失败的唯一可能就是_remote队列满了
+    while (!_remote_rq.push_locked(tid)) { 
         flush_nosignal_tasks_remote_locked(_remote_rq._mutex);
         LOG_EVERY_SECOND(ERROR) << "_remote_rq is full, capacity="
                                 << _remote_rq.capacity();

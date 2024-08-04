@@ -24,8 +24,9 @@
 #include <cstddef>                  // NULL
 #include "butil/macros.h"            
 
+//BAIDU_THREAD_LOCAL宏其实就是pthread的线程级变量
 #ifdef _MSC_VER
-#define BAIDU_THREAD_LOCAL __declspec(thread)
+#define BAIDU_THREAD_LOCAL __declspec(thread) //微软C++提供的扩展变量。用于声明线程局部存储变量，确保每个线程都有其自己的副本
 #else
 #define BAIDU_THREAD_LOCAL __thread
 #endif  // _MSC_VER

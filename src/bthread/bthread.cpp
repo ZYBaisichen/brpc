@@ -72,6 +72,8 @@ inline TaskControl* get_task_control() {
 
 inline TaskControl* get_or_new_task_control() {
     butil::atomic<TaskControl*>* p = (butil::atomic<TaskControl*>*)&g_task_control;
+    //该函数里会首先检查是否已经有task_control单例了，如果有说明其他地方已经建立过bthread了，也就已经启动了一定数量的taskgroup。
+    //如果没有说明是首次启动bthread，需要创建。new taskcontrol后会执行taskcontrol的init，核心就是用pthread启动指定数量的worker
     TaskControl* c = p->load(butil::memory_order_consume);
     if (c != NULL) {
         return c;
@@ -88,6 +90,7 @@ inline TaskControl* get_or_new_task_control() {
     int concurrency = FLAGS_bthread_min_concurrency > 0 ?
         FLAGS_bthread_min_concurrency :
         FLAGS_bthread_concurrency;
+    //根据并发量启动concurrency数量的worker
     if (c->init(concurrency) != 0) {
         LOG(ERROR) << "Fail to init g_task_control";
         delete c;
@@ -117,7 +120,7 @@ static bool validate_bthread_min_concurrency(const char*, int32_t val) {
         return true;
     }
 }
-
+//线程级变量
 __thread TaskGroup* tls_task_group_nosignal = NULL;
 
 BUTIL_FORCE_INLINE int
@@ -126,6 +129,7 @@ start_from_non_worker(bthread_t* __restrict tid,
                       void * (*fn)(void*),
                       void* __restrict arg) {
     TaskControl* c = get_or_new_task_control();
+    
     if (NULL == c) {
         return ENOMEM;
     }
@@ -178,6 +182,7 @@ int bthread_start_urgent(bthread_t* __restrict tid,
         // start from worker
         return bthread::TaskGroup::start_foreground(&g, tid, attr, fn, arg);
     }
+    //如果taskgroup为空，说明调用方不是在bthread中
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
@@ -185,6 +190,9 @@ int bthread_start_background(bthread_t* __restrict tid,
                              const bthread_attr_t* __restrict attr,
                              void * (*fn)(void*),
                              void* __restrict arg) {
+    //一个taskgroup对应一个worker，一个worker对应一个pthread，所有taskgroup由task_control控制
+    //tls_task_group是一个pthread线程级局部变量，指定当前线程归属的tls_task_group，如果为null，则表示当前线程不是bthread
+    //因为只要启动一个新的bthread，就会给tls_task_group赋值
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (g) {
         // start from worker
