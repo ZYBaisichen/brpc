@@ -1668,7 +1668,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     "消息”指向连接写出的有边界的二进制串，可能是发向上游client的response或下游server的request。多个线程可能会同时向一个fd发送消息，而写fd又是非原子的，所以如何高效率地排队不同线程写出的数据包是这里的关键。brpc使用一种wait-free MPSC链表来实现这个功能。所有待写出的数据都放在一个单链表节点中，next指针初始化为一个特殊值(Socket::WriteRequest::UNCONNECTED)。当一个线程想写出数据前，它先尝试和对应的链表头(Socket::_write_head)做原子交换，返回值是交换前的链表头。如果返回值为空，说明它获得了写出的权利，它会在原地写一次数据。否则说明有另一个线程在写，它把next指针指向返回的头以让链表连通。正在写的线程之后会看到新的头并写出这块数据。
     */
     // Release fence makes sure the thread getting request sees *req
-    //当前要写的请求尝试给_write_head复制，返回的是老的_write_head值，如果老的_write_head不为空，则代表已经有现成在写了
+    //当前要写的请求尝试给_write_head赋值，返回的是老的_write_head值，如果老的_write_head不为空，则代表已经有线程在写了
     //如果老的_write_head是空，则说明当前线程独占，此时_write_head等于req，其他线程将看到_write_head不为空
     WriteRequest* const prev_head =
         _write_head.exchange(req, butil::memory_order_release); 
@@ -1706,6 +1706,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     } else if (ret == 1) {
         // We are doing connection. Callback `KeepWriteIfConnected'
         // will be called with `req' at any moment after
+        //正在链接中， epoll out保证一旦连接上会接续写。
         return 0;
     }
 
@@ -2907,7 +2908,7 @@ void Socket::AddOutputBytes(size_t bytes) {
     GetOrNewSharedPart()->out_size.fetch_add(bytes, butil::memory_order_relaxed);
     _last_writetime_us.store(butil::cpuwide_time_us(),
                              butil::memory_order_relaxed);
-    CancelUnwrittenBytes(bytes);
+    CancelUnwrittenBytes(bytes); //取消了超时还没有写完的数据
 }
 void Socket::AddOutputMessages(size_t count) {
     GetOrNewSharedPart()->out_num_messages.fetch_add(count, butil::memory_order_relaxed);
